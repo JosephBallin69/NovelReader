@@ -1,0 +1,35 @@
+{
+    "readingSettings": {
+        "backgroundColor": [
+            0.10589999705553055,
+            0.10589999705553055,
+            0.10589999705553055,
+            1.0
+        ],
+        "customBackground": true,
+        "darkTheme": true,
+        "fontFamily": 0,
+        "fontSize": 26.0,
+        "header2FontScale": 1.5,
+        "header3FontScale": 1.25,
+        "headerColor": [
+            0.9200000166893005,
+            0.9200000166893005,
+            0.9399999976158142,
+            1.0
+        ],
+        "headerFontScale": 1.7999999523162842,
+        "lineSpacing": 1.399999976158142,
+        "marginSize": 25.0,
+        "readingWidth": 0,
+        "showScrollbar": true,
+        "smoothScrolling": true,
+        "textAlignment": 0,
+        "textColor": [
+            0.9200000166893005,
+            0.9200000166893005,
+            0.9399999976158142,
+            1.0
+        ]
+    }
+}

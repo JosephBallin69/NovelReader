@@ -1,0 +1,60 @@
+{
+  "sources": [
+    {
+      "name": "NovelFire",
+      "base_url": "https://novelfire.net",
+      "search_endpoint": "/search?q={query}",
+      "enabled": true,
+      "headers": {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate",
+        "Connection": "keep-alive"
+      },
+      "selectors": {
+        "search_item": ".novel-item",
+        "title": ".novel-title a",
+        "link": ".novel-title a",
+        "author": ".author-name",
+        "description": ".novel-excerpt",
+        "cover": ".novel-cover img",
+        "novel_title": "h1.novel-title",
+        "novel_author": ".author span[itemprop='author']",
+        "novel_description": ".summary .content p",
+        "novel_cover": ".novel-cover img, .cover img, img[alt*='Shadow Slave'], img[src*='shadow-slave']",
+        "chapter_list": ".chapter-list a, .chapters-wrapper a",
+        "chapter_title": ".chapter-title, span.chapter-title",
+        "chapter_content": "#content.clearfix",
+        "remove_selectors": [
+          ".nf-ads",
+          ".adv-3cd55358da52fc2056a359b6af1dcbdf",
+          ".PUBFUTURE",
+          ".chapternav",
+          ".report-container",
+          ".box-notification",
+          "#restore-scroll-btn",
+          "script",
+          "style",
+          "ins",
+          "[class*='pf-']",
+          "[id*='pf-']",
+          "[data-unit]",
+          ".bg-ssp-",
+          "[data-b2lyqnt8fra]",
+          "[data-gz-show-block-id]",
+          "[id*='bg-ssp']",
+          "[class*='bg-ssp']",
+          ".netpub-init",
+          "[id*='div_netpub']",
+          "[class*='publir']",
+          "[data-funnel]",
+          "[data-bg]",
+          ".bg-container-",
+          "[data-processed]",
+          "[data-zoneid]"
+        ]
+      }
+    }
+  ]
+}
