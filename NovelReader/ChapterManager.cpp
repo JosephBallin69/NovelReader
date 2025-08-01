@@ -436,7 +436,6 @@ void ChapterManager::RenderContentOnly() {
         resetscroll = true;
     }
 
-
     ParseMarkdownContent();
 
     if (chapters.empty()) {
@@ -446,8 +445,8 @@ void ChapterManager::RenderContentOnly() {
         return;
     }
 
-    // Calculate font scale based on settings (using Library's normal font size as base)
-    float fontScale = settings.fontSize / 18.0f; // 18.0f is your Library normal font size
+    // Calculate font scale based on settings
+    float fontScale = settings.fontSize / 18.0f;
 
     // Apply theme colors
     ImVec4 textColor = settings.darkTheme ? settings.textColor : ImVec4(0.1f, 0.1f, 0.1f, 1.0f);
@@ -463,13 +462,24 @@ void ChapterManager::RenderContentOnly() {
 
     ImGui::BeginChild("ReadingContent", availableSize, false, childFlags);
 
-    // Apply font scaling to the entire child window
+    // Apply font scaling
     ImGui::SetWindowFontScale(fontScale);
-    
+
     if (resetscroll) {
         ImGui::SetScrollHereY(settings.scrollPosition);
     }
-    
+
+    // Auto-mark chapter as read when user scrolls past 80%
+    float scrollY = ImGui::GetScrollY();
+    float maxScrollY = ImGui::GetScrollMaxY();
+    if (maxScrollY > 0 && scrollY / maxScrollY > 0.8f && libraryPtr && !novelTitle.empty()) {
+        // Only update if we haven't already marked this chapter as read
+        if (settings.currentChapter > 0) {
+            libraryPtr->UpdateReadingProgress(novelTitle, settings.currentChapter);
+        }
+    }
+
+    // ... rest of rendering code stays the same ...
 
     // Calculate reading width based on settings
     float fullWidth = ImGui::GetContentRegionAvail().x;
@@ -490,7 +500,48 @@ void ChapterManager::RenderContentOnly() {
         ImDrawList* drawList = ImGui::GetWindowDrawList();
         ImVec2 contentStart = ImGui::GetCursorScreenPos();
         contentStart.x -= 10.0f;
-        ImVec2 contentEnd = ImVec2(contentStart.x + readingWidth + 20.0f, contentStart.y + availableSize.y);
+
+        // Calculate total content height by estimating
+        float totalContentHeight = settings.marginSize; // Top padding
+
+        // Estimate content height
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4.0f, settings.lineSpacing * 4.0f));
+        for (const auto& element : parsedContent) {
+            switch (element.type) {
+            case TextElement::HEADER1:
+                totalContentHeight += settings.lineSpacing * 15.0f;
+                totalContentHeight += ImGui::GetTextLineHeight() * settings.headerFontScale;
+                totalContentHeight += settings.lineSpacing * 20.0f;
+                break;
+            case TextElement::HEADER2:
+                totalContentHeight += settings.lineSpacing * 12.0f;
+                totalContentHeight += ImGui::GetTextLineHeight() * settings.header2FontScale;
+                totalContentHeight += settings.lineSpacing * 15.0f;
+                break;
+            case TextElement::HEADER3:
+                totalContentHeight += settings.lineSpacing * 10.0f;
+                totalContentHeight += ImGui::GetTextLineHeight() * settings.header3FontScale;
+                totalContentHeight += settings.lineSpacing * 12.0f;
+                break;
+            case TextElement::PARAGRAPH_BREAK:
+                totalContentHeight += settings.lineSpacing * 15.0f;
+                break;
+            case TextElement::TEXT:
+            case TextElement::BOLD:
+            case TextElement::ITALIC:
+                if (!element.text.empty()) {
+                    float textWidth = readingWidth - 20.0f;
+                    int estimatedLines = (int)((element.text.length() * ImGui::GetTextLineHeight() * 0.6f) / textWidth) + 1;
+                    totalContentHeight += ImGui::GetTextLineHeight() * estimatedLines;
+                }
+                break;
+            }
+        }
+        totalContentHeight += settings.marginSize * 2;
+        ImGui::PopStyleVar();
+
+        // Draw background rectangle
+        ImVec2 contentEnd = ImVec2(contentStart.x + readingWidth + 20.0f, contentStart.y + totalContentHeight);
         drawList->AddRectFilled(contentStart, contentEnd, ImGui::ColorConvertFloat4ToU32(settings.backgroundColor));
     }
 
@@ -510,10 +561,9 @@ void ChapterManager::RenderContentOnly() {
             ImGui::Dummy(ImVec2(0, settings.lineSpacing * 15.0f));
             ImGui::PushStyleColor(ImGuiCol_Text, settings.headerColor);
 
-            // Use temporary font scaling for headers
             ImGui::SetWindowFontScale(fontScale * settings.headerFontScale);
             ImGui::TextWrapped("%s", element.text.c_str());
-            ImGui::SetWindowFontScale(fontScale); // Reset to base scale
+            ImGui::SetWindowFontScale(fontScale);
 
             ImGui::PopStyleColor();
             ImGui::Dummy(ImVec2(0, settings.lineSpacing * 20.0f));
@@ -610,8 +660,21 @@ void ChapterManager::RenderContentOnly() {
     // End columns
     ImGui::Columns(1);
 
-    // Remember scroll position
-    settings.scrollPosition = ImGui::GetScrollY();
+    float currentScroll = ImGui::GetScrollY();
+    if (std::abs(currentScroll - settings.scrollPosition) > 1.0f) {
+        settings.scrollPosition = currentScroll;
+
+        // Save position periodically
+        static float lastSaveTime = 0.0f;
+        float currentTime = ImGui::GetTime();
+        if (currentTime - lastSaveTime > 5.0f) { // Save every 5 seconds
+            if (libraryPtr && !novelTitle.empty()) {
+                libraryPtr->SaveReadingPosition(novelTitle, Library::ContentType::NOVEL,
+                    settings.currentChapter, settings.scrollPosition);
+            }
+            lastSaveTime = currentTime;
+        }
+    }
 
     ImGui::EndChild();
 
@@ -621,6 +684,7 @@ void ChapterManager::RenderContentOnly() {
 
 // Existing functions with minimal changes needed for compilation
 bool ChapterManager::LoadChapter(const std::string& filePath) {
+
     try {
         std::ifstream file(filePath);
         if (!file.is_open()) {
@@ -757,13 +821,25 @@ void ChapterManager::ParseInlineFormatting(const std::string& line) {
         size_t boldStart = currentText.find("**", pos);
         size_t italicStart = currentText.find("*", pos);
 
+        // Skip if italic is part of bold marker
         if (italicStart != std::string::npos && italicStart == boldStart) {
             italicStart = currentText.find("*", boldStart + 2);
+            if (italicStart != std::string::npos && italicStart == boldStart + 1) {
+                // This is still part of **, look for next single *
+                italicStart = currentText.find("*", boldStart + 2);
+                while (italicStart != std::string::npos &&
+                    italicStart + 1 < currentText.length() &&
+                    currentText[italicStart + 1] == '*') {
+                    italicStart = currentText.find("*", italicStart + 2);
+                }
+            }
         }
 
+        // Process bold first if it comes before italic
         if (boldStart != std::string::npos &&
             (italicStart == std::string::npos || boldStart < italicStart)) {
 
+            // Add text before bold
             if (boldStart > pos) {
                 std::string beforeText = currentText.substr(pos, boldStart - pos);
                 if (!beforeText.empty()) {
@@ -771,6 +847,7 @@ void ChapterManager::ParseInlineFormatting(const std::string& line) {
                 }
             }
 
+            // Find end of bold
             size_t boldEnd = currentText.find("**", boldStart + 2);
             if (boldEnd != std::string::npos) {
                 std::string boldText = currentText.substr(boldStart + 2, boldEnd - boldStart - 2);
@@ -780,6 +857,7 @@ void ChapterManager::ParseInlineFormatting(const std::string& line) {
                 pos = boldEnd + 2;
             }
             else {
+                // No closing **, treat as regular text
                 std::string remainingText = currentText.substr(boldStart);
                 if (!remainingText.empty()) {
                     parsedContent.emplace_back(TextElement::TEXT, remainingText);
@@ -787,7 +865,9 @@ void ChapterManager::ParseInlineFormatting(const std::string& line) {
                 break;
             }
         }
+        // Process italic
         else if (italicStart != std::string::npos) {
+            // Add text before italic
             if (italicStart > pos) {
                 std::string beforeText = currentText.substr(pos, italicStart - pos);
                 if (!beforeText.empty()) {
@@ -795,14 +875,18 @@ void ChapterManager::ParseInlineFormatting(const std::string& line) {
                 }
             }
 
+            // Find end of italic (next single * that's not part of **)
             size_t italicEnd = italicStart + 1;
             while (italicEnd < currentText.length()) {
                 if (currentText[italicEnd] == '*') {
+                    // Check if this is part of **
                     if (italicEnd + 1 < currentText.length() && currentText[italicEnd + 1] == '*') {
+                        // Skip this **, continue looking
                         italicEnd += 2;
                         continue;
                     }
                     else {
+                        // Found single *, this is our end
                         break;
                     }
                 }
@@ -817,6 +901,7 @@ void ChapterManager::ParseInlineFormatting(const std::string& line) {
                 pos = italicEnd + 1;
             }
             else {
+                // No closing *, treat as regular text
                 std::string remainingText = currentText.substr(italicStart);
                 if (!remainingText.empty()) {
                     parsedContent.emplace_back(TextElement::TEXT, remainingText);
@@ -824,6 +909,7 @@ void ChapterManager::ParseInlineFormatting(const std::string& line) {
                 break;
             }
         }
+        // No more formatting, add remaining text
         else {
             std::string remainingText = currentText.substr(pos);
             if (!remainingText.empty()) {
@@ -883,13 +969,19 @@ void ChapterManager::Render() {
 }
 
 void ChapterManager::OpenChapter(int chapterNumber) {
-    if (chapterNumber >= 1 && chapterNumber <= (int)chapters.size()) {
+    if (chapterNumber >= 1 && chapterNumber <= static_cast<int>(chapters.size())) {
         settings.currentChapter = chapterNumber;
         settings.scrollPosition = 0.0f;
         contentNeedsReparsing = true;
-    }
-    else {
-        std::cout << "Failed at opening chapter" << std::endl;
+
+        // Notify Library of reading progress update
+        if (libraryPtr && !novelTitle.empty()) {
+            libraryPtr->UpdateReadingProgress(novelTitle, chapterNumber);
+            libraryPtr->SaveReadingPosition(novelTitle, Library::ContentType::NOVEL,
+                chapterNumber, 0.0f);
+        }
+
+        std::cout << "Opened chapter " << chapterNumber << std::endl;
     }
 }
 
@@ -898,14 +990,20 @@ void ChapterManager::SetNovelTitle(const std::string& title) {
 }
 
 void ChapterManager::LoadChaptersFromDirectory(const std::string& novelName) {
-    std::string chaptersDir = "Novels/" + novelName + "/chapters";
+    // Only reload if different novel
+    if (cachedNovelName == novelName && chaptersLoadedInCache) {
+        std::cout << "Using cached chapters for " << novelName << std::endl;
+        return;
+    }
 
+    std::string chaptersDir = "Novels/" + novelName + "/chapters";
     if (!std::filesystem::exists(chaptersDir)) {
         std::cout << "Chapters directory doesn't exist: " << chaptersDir << std::endl;
         return;
     }
 
     chapters.clear();
+    chaptersLoadedInCache = false;
 
     for (const auto& entry : std::filesystem::directory_iterator(chaptersDir)) {
         if (entry.path().extension() == ".json") {
@@ -917,6 +1015,8 @@ void ChapterManager::LoadChaptersFromDirectory(const std::string& novelName) {
         settings.currentChapter = 1;
         contentNeedsReparsing = true;
         novelTitle = novelName;
+        cachedNovelName = novelName;
+        chaptersLoadedInCache = true;
     }
 }
 
@@ -927,20 +1027,20 @@ void ChapterManager::RenderEnhancedSettingsPanel() {
     ImGui::SetNextWindowSize(ImVec2(650, 750), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos(ImVec2(100, 100), ImGuiCond_FirstUseEver);
 
-    if (ImGui::Begin("📖 Reading Settings", &showSettings, ImGuiWindowFlags_AlwaysVerticalScrollbar)) {
+    if (ImGui::Begin(ICON_FA_BOOK " Reading Settings", &showSettings, ImGuiWindowFlags_AlwaysVerticalScrollbar)) {
 
         // Header with current chapter info
         if (!chapters.empty() && settings.currentChapter >= 1 && settings.currentChapter <= (int)chapters.size()) {
             const Chapter& current = chapters[settings.currentChapter - 1];
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.7f, 0.9f, 1.0f, 1.0f));
-            ImGui::Text("📚 %s - Chapter %d: %s", novelTitle.c_str(), current.chapterNumber, current.title.c_str());
+            ImGui::Text(ICON_FA_BOOK " %s - Chapter %d: %s", novelTitle.c_str(), current.chapterNumber, current.title.c_str());
             ImGui::PopStyleColor();
             ImGui::Separator();
         }
 
         if (ImGui::BeginTabBar("SettingsTabs", ImGuiTabBarFlags_FittingPolicyScroll)) {
 
-            if (ImGui::BeginTabItem("🔤 Typography")) {
+            if (ImGui::BeginTabItem(ICON_FA_FONT " Typography")) {
                 RenderTypographyTab();
                 ImGui::EndTabItem();
             }
@@ -968,7 +1068,7 @@ void ChapterManager::RenderEnhancedSettingsPanel() {
         // Action buttons with better styling
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.7f, 0.2f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.3f, 0.8f, 0.3f, 1.0f));
-        if (ImGui::Button("💾 Save Settings", ImVec2(130, 35))) {
+        if (ImGui::Button(ICON_FA_FLOPPY_DISK " Save Settings", ImVec2(130, 35))) {
             SaveSettings();
         }
         ImGui::PopStyleColor(2);
@@ -976,7 +1076,7 @@ void ChapterManager::RenderEnhancedSettingsPanel() {
         ImGui::SameLine();
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.4f, 0.2f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.9f, 0.5f, 0.3f, 1.0f));
-        if (ImGui::Button("🔄 Reset to Defaults", ImVec2(150, 35))) {
+        if (ImGui::Button(ICON_FA_ROTATE " Reset to Defaults", ImVec2(150, 35))) {
             settings = ReadingSettings(); // Reset to improved defaults
             contentNeedsReparsing = true;
             LoadReadingFonts(); // Reload fonts with new settings
@@ -984,7 +1084,7 @@ void ChapterManager::RenderEnhancedSettingsPanel() {
         ImGui::PopStyleColor(2);
 
         ImGui::SameLine();
-        if (ImGui::Button("❌ Close", ImVec2(80, 35))) {
+        if (ImGui::Button(ICON_FA_XMARK " Close", ImVec2(80, 35))) {
             showSettings = false;
         }
     }

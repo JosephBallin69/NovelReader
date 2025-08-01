@@ -1,4 +1,5 @@
-﻿#include "Library.h"
+﻿#define NOMINMAX
+#include "Library.h"
 #include "Dependecies/json.h"
 #include <filesystem>
 #include <fstream>
@@ -8,18 +9,13 @@
 #include <memory>
 #include <algorithm>
 #include <sstream>
+#include <regex>
 #include "ImGui/imgui_impl_vulkan.h"
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "Dependecies/stb_image.h"
-
-#ifdef _WIN32
-#include <io.h>
-#include <fcntl.h>
-#else
-#include <unistd.h>
-#endif
 #include "Dependecies/FontAwesome.h"
+
 
 using json = nlohmann::json;
 
@@ -80,10 +76,56 @@ Library::Library(ImGuiApp::Application* application) : app(application) {
 }
 
 Library::~Library() {
+    std::cout << "Library destructor: Starting cleanup..." << std::endl;
+
+    shouldTerminateDownloads = true;
+
+    // Save all persistent data before cleanup
+    SaveDownloadStates();
+    SaveAllReadingPositions();
+    SaveNovels(novellist);
+
+    // Signal all active processes to stop
+    {
+        std::lock_guard<std::mutex> lock(downloadStateMutex);
+        for (auto& [id, processInfo] : activeProcesses) {
+            processInfo.shouldTerminate.store(true);
+
+            // Create stop signal
+            std::string stopSignalFile = "downloads/.stop_" + id;
+            std::filesystem::create_directories("downloads");
+            std::ofstream stopFile(stopSignalFile);
+            if (stopFile.is_open()) {
+                stopFile << "TERMINATE" << std::endl;
+                stopFile.close();
+            }
+        }
+    }
+
     StopDownloadManager();
+
+    // Wait for all threads to finish properly
+    {
+        std::lock_guard<std::mutex> lock(downloadStateMutex);
+        for (auto& [id, processInfo] : activeProcesses) {
+            if (processInfo.thread && processInfo.thread->joinable()) {
+                std::cout << "Waiting for thread to finish: " << id << std::endl;
+                processInfo.thread->join();
+            }
+        }
+        // Clear the map - destructors will be called properly
+        activeProcesses.clear();
+    }
+
+    // Clean up stop signals
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    CleanupStopSignals();
+
+    std::cout << "Library destructor: Cleanup completed" << std::endl;
+
     CleanupTextures();
     CleanupTextureSampler();
-    CleanupFonts(); // Add this line
+    CleanupFonts();
 }
 
 void Library::OnReadingSettingsChanged() {
@@ -575,17 +617,344 @@ VkDescriptorSet Library::LoadCoverTexture(const std::string& imagePath) {
     return result;
 }
 
+void Library::SwitchToMangaReading(const std::string& mangaName, int chapter, int page) {
+    currentState = UIState::READING;
+    currentNovelName = mangaName;
+    mangaViewer.mangaName = mangaName;
+    mangaViewer.currentChapter = chapter;
+    mangaViewer.currentPage = page;
+
+    // Load reading position if not specified
+    if (page == 0) {
+        auto pos = LoadReadingPosition(mangaName);
+        if (pos.contentName == mangaName) {
+            mangaViewer.currentChapter = pos.currentChapter;
+            mangaViewer.currentPage = pos.currentPage;
+        }
+    }
+
+    LoadMangaChapter(mangaName, mangaViewer.currentChapter);
+}
+
+void Library::LoadMangaChapter(const std::string& mangaName, int chapter) {
+    mangaViewer.isLoading = true;
+    mangaViewer.pageFiles.clear();
+
+    std::string chapterDir = "Manga/" + mangaName + "/Chapter_" +
+        std::to_string(chapter).insert(0, 3 - std::to_string(chapter).length(), '0');
+
+    if (!std::filesystem::exists(chapterDir)) {
+        std::cout << "Chapter directory not found: " << chapterDir << std::endl;
+        mangaViewer.isLoading = false;
+        return;
+    }
+
+    // Load metadata
+    std::string metadataPath = chapterDir + "/metadata.json";
+    if (std::filesystem::exists(metadataPath)) {
+        try {
+            std::ifstream file(metadataPath);
+            json j;
+            file >> j;
+            file.close();
+
+            mangaViewer.totalPages = j.value("page_count", 0);
+        }
+        catch (...) {
+            mangaViewer.totalPages = 0;
+        }
+    }
+
+    // Find all image files
+    for (const auto& entry : std::filesystem::directory_iterator(chapterDir)) {
+        if (entry.is_regular_file()) {
+            std::string filename = entry.path().filename().string();
+            if (filename.starts_with("page_") &&
+                (filename.ends_with(".jpg") || filename.ends_with(".png") ||
+                    filename.ends_with(".gif") || filename.ends_with(".webp"))) {
+                mangaViewer.pageFiles.push_back(entry.path().string());
+            }
+        }
+    }
+
+    // Sort by filename
+    std::sort(mangaViewer.pageFiles.begin(), mangaViewer.pageFiles.end());
+
+    mangaViewer.totalPages = mangaViewer.pageFiles.size();
+    mangaViewer.currentPage = 0;
+    mangaViewer.isLoading = false;
+
+    // Save reading position
+    SaveReadingPosition(mangaName, ContentType::MANGA, chapter, 0.0f, 0);
+}
+
+void Library::RenderMangaReader() {
+    ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(viewport->WorkPos);
+    ImGui::SetNextWindowSize(viewport->WorkSize);
+
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoResize | ImGuiWindowFlags_MenuBar;
+
+    if (ImGui::Begin("Manga Reader", nullptr, flags)) {
+        // Menu bar
+        if (ImGui::BeginMenuBar()) {
+            if (ImGui::Button(ICON_FA_ARROW_LEFT " Back")) {
+                SwitchToLibrary();
+            }
+
+            ImGui::Separator();
+
+            // Chapter info
+            ImGui::Text("%s - Chapter %d", mangaViewer.mangaName.c_str(), mangaViewer.currentChapter);
+
+            ImGui::Separator();
+
+            // Page navigation
+            if (ImGui::Button(ICON_FA_ARROW_LEFT)) {
+                NavigateMangaPage(-1);
+            }
+
+            ImGui::SameLine();
+            ImGui::Text("Page %d/%d", mangaViewer.currentPage + 1, mangaViewer.totalPages);
+
+            ImGui::SameLine();
+            if (ImGui::Button(ICON_FA_ARROW_RIGHT)) {
+                NavigateMangaPage(1);
+            }
+
+            ImGui::EndMenuBar();
+        }
+
+        // Content area
+        ImVec2 availableSize = ImGui::GetContentRegionAvail();
+
+        if (mangaViewer.isLoading) {
+            ImGui::SetCursorPos(ImVec2(availableSize.x * 0.5f - 50, availableSize.y * 0.5f));
+            ImGui::Text("Loading...");
+        }
+        else if (mangaViewer.currentPage < mangaViewer.pageFiles.size()) {
+            // Load and display current page
+            std::string currentFile = mangaViewer.pageFiles[mangaViewer.currentPage];
+            VkDescriptorSet pageTexture = LoadMangaPage(currentFile);
+
+            if (pageTexture != VK_NULL_HANDLE) {
+                // Calculate display size to fit window
+                auto textureIt = coverTextures.find(currentFile);
+                if (textureIt != coverTextures.end()) {
+                    CoverTexture& texture = textureIt->second;
+                    float aspectRatio = (float)texture.width / (float)texture.height;
+
+                    float displayHeight = availableSize.y - 20;
+                    float displayWidth = displayHeight * aspectRatio;
+
+                    if (displayWidth > availableSize.x - 20) {
+                        displayWidth = availableSize.x - 20;
+                        displayHeight = displayWidth / aspectRatio;
+                    }
+
+                    // Center the image
+                    ImVec2 imagePos = ImVec2(
+                        (availableSize.x - displayWidth) * 0.5f,
+                        (availableSize.y - displayHeight) * 0.5f
+                    );
+
+                    ImGui::SetCursorPos(imagePos);
+                    ImGui::Image(reinterpret_cast<ImTextureID>(pageTexture),
+                        ImVec2(displayWidth, displayHeight));
+                }
+            }
+        }
+
+        // Handle keyboard navigation
+        if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) {
+            NavigateMangaPage(-1);
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) {
+            NavigateMangaPage(1);
+        }
+    }
+    ImGui::End();
+}
+
+void Library::NavigateMangaPage(int direction) {
+    int newPage = mangaViewer.currentPage + direction;
+
+    if (newPage < 0) {
+        // Go to previous chapter
+        if (mangaViewer.currentChapter > 1) {
+            LoadMangaChapter(mangaViewer.mangaName, mangaViewer.currentChapter - 1);
+            mangaViewer.currentPage = mangaViewer.totalPages - 1;
+        }
+    }
+    else if (newPage >= mangaViewer.totalPages) {
+        // Go to next chapter
+        LoadMangaChapter(mangaViewer.mangaName, mangaViewer.currentChapter + 1);
+        mangaViewer.currentPage = 0;
+    }
+    else {
+        mangaViewer.currentPage = newPage;
+        SaveReadingPosition(mangaViewer.mangaName, ContentType::MANGA,
+            mangaViewer.currentChapter, 0.0f, mangaViewer.currentPage);
+    }
+}
+
+VkDescriptorSet Library::LoadMangaPage(const std::string& imagePath) {
+    // Use existing texture loading system
+    return LoadCoverTexture(imagePath);
+}
+
+void Library::RenderSearchFilters() {
+    ImGui::BeginGroup();
+
+    // Content type filter
+    ImGui::Text("Content Type:");
+    ImGui::SameLine();
+    const char* types[] = { "All", "Novel", "Manga", "Manhwa", "Manhua" };
+    int currentType = static_cast<int>(currentSearchFilter.contentType);
+    ImGui::SetNextItemWidth(120);
+    if (ImGui::Combo("##ContentType", &currentType, types, 5)) {
+        currentSearchFilter.contentType = static_cast<ContentType>(currentType);
+    }
+
+    ImGui::SameLine();
+    ImGui::Text("Max Results:");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(60);
+    ImGui::SliderInt("##MaxResults", &currentSearchFilter.maxResults, 1, 10);
+
+    ImGui::SameLine();
+    ImGui::Checkbox("Show Adult Content", &currentSearchFilter.showAdult);
+
+    // Language filter
+    ImGui::Text("Language:");
+    ImGui::SameLine();
+    static char langBuffer[32] = "";
+    ImGui::SetNextItemWidth(80);
+    if (ImGui::InputText("##Language", langBuffer, sizeof(langBuffer))) {
+        currentSearchFilter.language = std::string(langBuffer);
+    }
+
+    ImGui::EndGroup();
+}
+
+void Library::SaveReadingPosition(const std::string& contentName, ContentType type,
+    int chapter, float scrollPos, int page) {
+    try {
+        std::filesystem::create_directories("reading_positions");
+
+        ReadingPosition pos;
+        pos.contentName = contentName;
+        pos.type = type;
+        pos.currentChapter = chapter;
+        pos.scrollPosition = scrollPos;
+        pos.currentPage = page;
+        pos.lastRead = std::time(nullptr);
+
+        readingPositions[contentName] = pos;
+
+        // Save to file
+        json j;
+        j["contentName"] = pos.contentName;
+        j["type"] = static_cast<int>(pos.type);
+        j["currentChapter"] = pos.currentChapter;
+        j["scrollPosition"] = pos.scrollPosition;
+        j["currentPage"] = pos.currentPage;
+        j["lastRead"] = pos.lastRead;
+
+        std::string filename = "reading_positions/" +
+            std::regex_replace(contentName, std::regex("[^a-zA-Z0-9]"), "_") + ".json";
+
+        std::ofstream file(filename);
+        if (file.is_open()) {
+            file << j.dump(4);
+            file.close();
+        }
+    }
+    catch (const std::exception& e) {
+        std::cout << "Error saving reading position: " << e.what() << std::endl;
+    }
+}
+
+Library::ReadingPosition Library::LoadReadingPosition(const std::string& contentName) {
+    try {
+        std::string filename = "reading_positions/" +
+            std::regex_replace(contentName, std::regex("[^a-zA-Z0-9]"), "_") + ".json";
+
+        std::ifstream file(filename);
+        if (!file.is_open()) {
+            return ReadingPosition();
+        }
+
+        json j;
+        file >> j;
+        file.close();
+
+        ReadingPosition pos;
+        pos.contentName = j.value("contentName", "");
+        pos.type = static_cast<ContentType>(j.value("type", 0));
+        pos.currentChapter = j.value("currentChapter", 1);
+        pos.scrollPosition = j.value("scrollPosition", 0.0f);
+        pos.currentPage = j.value("currentPage", 0);
+        pos.lastRead = j.value("lastRead", std::time_t{ 0 });
+
+        readingPositions[contentName] = pos;
+        return pos;
+    }
+    catch (const std::exception& e) {
+        std::cout << "Error loading reading position: " << e.what() << std::endl;
+        return ReadingPosition();
+    }
+}
+
+void Library::LoadAllReadingPositions() {
+    try {
+        std::filesystem::path posDir = "reading_positions";
+        if (!std::filesystem::exists(posDir)) {
+            return;
+        }
+
+        for (const auto& entry : std::filesystem::directory_iterator(posDir)) {
+            if (entry.path().extension() == ".json") {
+                std::ifstream file(entry.path());
+                if (file.is_open()) {
+                    json j;
+                    file >> j;
+                    file.close();
+
+                    std::string contentName = j.value("contentName", "");
+                    if (!contentName.empty()) {
+                        ReadingPosition pos;
+                        pos.contentName = contentName;
+                        pos.type = static_cast<ContentType>(j.value("type", 0));
+                        pos.currentChapter = j.value("currentChapter", 1);
+                        pos.scrollPosition = j.value("scrollPosition", 0.0f);
+                        pos.currentPage = j.value("currentPage", 0);
+                        pos.lastRead = j.value("lastRead", std::time_t{ 0 });
+
+                        readingPositions[contentName] = pos;
+                    }
+                }
+            }
+        }
+    }
+    catch (const std::exception& e) {
+        std::cout << "Error loading reading positions: " << e.what() << std::endl;
+    }
+}
+
+
 VkDescriptorSet Library::CreateTextureFromPixels(stbi_uc* pixels, int width, int height,
     const std::string& imagePath) {
     VkDeviceSize imageSize = width * height * 4;
 
+    // Don't apply gamma correction - use pixels as-is
     try {
-        // Create staging buffer
         VkBuffer stagingBuffer;
         VkDeviceMemory stagingBufferMemory;
         CreateStagingBuffer(imageSize, pixels, stagingBuffer, stagingBufferMemory);
 
-        // Create Vulkan image
+        // Create Vulkan image with UNORM format instead of SRGB
         CoverTexture texture = CreateVulkanImage(width, height);
 
         // Copy data and transition layouts
@@ -669,8 +1038,8 @@ void Library::SwitchToReading(const std::string& novelName, int chapter) {
     chaptermanager.OpenChapter(chapter);
     chaptermanager.SetNovelTitle(novelName);
 
-    // Add this line to connect ChapterManager to Library
-    chaptermanager.SetLibraryPointer(this);
+    // Update reading progress immediately when switching to reading
+    UpdateReadingProgress(novelName, chapter);
 
     std::cout << "Switched to Reading view: " << novelName << " Chapter " << chapter << std::endl;
 }
@@ -723,14 +1092,25 @@ void Library::LoadAllNovelsFromFile() {
 void Library::UpdateReadingProgress(const std::string& novelName, int chapterNumber) {
     for (auto& novel : novellist) {
         if (novel.name == novelName) {
+            // Update progress if this chapter is further than current progress
             if (chapterNumber > novel.progress.readchapters) {
                 novel.progress.readchapters = chapterNumber;
-                // Calculate percentage based on downloaded chapters, not total
+            }
+
+            // Calculate percentage based on downloaded chapters
+            if (novel.downloadedchapters > 0) {
                 novel.progress.progresspercentage =
                     (static_cast<float>(novel.progress.readchapters) / static_cast<float>(novel.downloadedchapters)) * 100.0f;
-                SaveNovels(novellist);
-                std::cout << "Updated reading progress for " << novelName << " to chapter " << chapterNumber << std::endl;
             }
+
+            // Cap at 100%
+            if (novel.progress.progresspercentage > 100.0f) {
+                novel.progress.progresspercentage = 100.0f;
+            }
+
+            SaveNovels(novellist);
+            std::cout << "Updated reading progress for " << novelName << " to chapter " << chapterNumber
+                << " (" << novel.progress.progresspercentage << "%)" << std::endl;
             break;
         }
     }
@@ -834,17 +1214,24 @@ bool Library::RemoveNovel(const std::string& novelName, const std::string& autho
 // ============================================================================
 
 void Library::Render() {
-    // Check if fonts need reinitialization
     if (!uiFonts.initialized) {
         InitializeUIFonts();
     }
 
-    // Rest of render code - NO font rebuilding here
     switch (currentState) {
     case UIState::LIBRARY:
         RenderLibraryInterface();
         break;
     case UIState::READING:
+        // Check content type
+        if (readingPositions.count(currentNovelName) > 0) {
+            auto& pos = readingPositions[currentNovelName];
+            if (pos.type == ContentType::MANGA || pos.type == ContentType::MANHWA ||
+                pos.type == ContentType::MANHUA) {
+                RenderMangaReader();
+                return;
+            }
+        }
         RenderFullScreenReading();
         break;
     }
@@ -1091,13 +1478,7 @@ void Library::RenderCardBackground(const ImVec2& start, const ImVec2& end, bool 
 }
 
 void Library::RenderCardContent(const Novel& novel, const ImVec2& cardStart, bool isSelected) {
-    // Use ImDrawList for all rendering to avoid cursor position issues
-    ImDrawList* drawList = ImGui::GetWindowDrawList();
-
-    // Render cover area
-    ImVec2 coverStart = ImVec2(cardStart.x + 10, cardStart.y + 10);
-    ImVec2 coverEnd = ImVec2(coverStart.x + CARD_WIDTH - 20, coverStart.y + COVER_AREA_HEIGHT);
-
+    // Render cover area first
     VkDescriptorSet coverTexture = GetCoverTexture(novel.coverpath);
     if (coverTexture != VK_NULL_HANDLE && coverTextures.find(novel.coverpath) != coverTextures.end()) {
         CoverTexture& texture = coverTextures[novel.coverpath];
@@ -1116,24 +1497,19 @@ void Library::RenderCardContent(const Novel& novel, const ImVec2& cardStart, boo
         float centerX = (coverAreaWidth - displayWidth) * 0.5f;
         float centerY = (COVER_AREA_HEIGHT - displayHeight) * 0.5f;
 
-        ImVec2 imageStart = ImVec2(coverStart.x + centerX, coverStart.y + centerY);
+        ImVec2 imageStart = ImVec2(cardStart.x + 10 + centerX, cardStart.y + 10 + centerY);
         ImVec2 imageEnd = ImVec2(imageStart.x + displayWidth, imageStart.y + displayHeight);
 
+        ImDrawList* drawList = ImGui::GetWindowDrawList();
         drawList->AddImage(reinterpret_cast<ImTextureID>(coverTexture), imageStart, imageEnd);
     }
     else {
-        // Render placeholder
-        drawList->AddRectFilled(coverStart, coverEnd, IM_COL32(40, 40, 45, 255), 4.0f);
-        drawList->AddRect(coverStart, coverEnd, IM_COL32(80, 80, 90, 255), 4.0f);
-
-        // Add placeholder text
-        ImVec2 textPos = ImVec2(coverStart.x + (CARD_WIDTH - 20) * 0.5f - 30,
-            coverStart.y + COVER_AREA_HEIGHT * 0.5f - 10);
-        drawList->AddText(textPos, IM_COL32(128, 128, 128, 255), "No Cover");
-        drawList->AddText(ImVec2(textPos.x, textPos.y + 20), IM_COL32(128, 128, 128, 255), "Available");
+        // Render placeholder with fixed positioning
+        RenderPlaceholderCover(cardStart);
     }
 
-    // Render text info
+    // Render text info below the cover area
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
     ImVec2 infoStart = ImVec2(cardStart.x + 10, cardStart.y + COVER_AREA_HEIGHT + 30);
 
     // Title
@@ -1158,8 +1534,10 @@ void Library::RenderCardContent(const Novel& novel, const ImVec2& cardStart, boo
 
     // Progress fill
     float progress = novel.progress.progresspercentage / 100.0f;
-    ImVec2 fillEnd = ImVec2(progressStart.x + ((CARD_WIDTH - 20) * progress), progressEnd.y);
-    drawList->AddRectFilled(progressStart, fillEnd, IM_COL32(51, 179, 76, 255), 2.0f);
+    if (progress > 0.0f) {
+        ImVec2 fillEnd = ImVec2(progressStart.x + ((CARD_WIDTH - 20) * progress), progressEnd.y);
+        drawList->AddRectFilled(progressStart, fillEnd, IM_COL32(51, 179, 76, 255), 2.0f);
+    }
 
     // Progress text
     std::string progressText = std::to_string(static_cast<int>(novel.progress.progresspercentage)) + "% complete";
@@ -1232,15 +1610,20 @@ void Library::RenderPlaceholderCover(const ImVec2& cardStart) {
     drawList->AddRectFilled(placeholderStart, placeholderEnd, IM_COL32(40, 40, 45, 255), 4.0f);
     drawList->AddRect(placeholderStart, placeholderEnd, IM_COL32(80, 80, 90, 255), 4.0f);
 
-    // Add placeholder text using ImDrawList to avoid cursor issues
-    ImU32 textColor = IM_COL32(128, 128, 128, 255);
-    ImVec2 centerPos = ImVec2(
-        placeholderStart.x + placeholderWidth * 0.5f - 30,
-        placeholderStart.y + placeholderHeight * 0.5f - 10
-    );
+    // Calculate center position for text
+    ImVec2 textSize1 = ImGui::CalcTextSize("No Cover");
+    ImVec2 textSize2 = ImGui::CalcTextSize("Available");
 
-    drawList->AddText(centerPos, textColor, "No Cover");
-    drawList->AddText(ImVec2(centerPos.x, centerPos.y + 20), textColor, "Available");
+    float centerX = placeholderStart.x + placeholderWidth * 0.5f;
+    float centerY = placeholderStart.y + placeholderHeight * 0.5f;
+
+    // Draw centered text
+    ImU32 textColor = IM_COL32(128, 128, 128, 255);
+    ImVec2 textPos1 = ImVec2(centerX - textSize1.x * 0.5f, centerY - textSize1.y - 5);
+    ImVec2 textPos2 = ImVec2(centerX - textSize2.x * 0.5f, centerY + 5);
+
+    drawList->AddText(textPos1, textColor, "No Cover");
+    drawList->AddText(textPos2, textColor, "Available");
 }
 
 void Library::RenderCardInfo(const Novel& novel, const ImVec2& cardStart) {
@@ -2017,10 +2400,19 @@ void Library::CreateDefaultDownloadSources() {
 
 bool Library::CallPythonScript(const std::string& scriptName, const std::vector<std::string>& args,
     std::string& output) {
-    std::string command = "python " + scriptName;
+
+    // Check if Python script exists
+    if (!std::filesystem::exists(scriptName)) {
+        std::cout << "Error: Python script not found: " << scriptName << std::endl;
+        output = "Python script not found";
+        return false;
+    }
+
+    std::string command = "python \"" + scriptName + "\"";
     for (const auto& arg : args) {
         command += " \"" + arg + "\"";
     }
+
     std::cout << "Executing: " << command << std::endl;
 
 #ifdef _WIN32
@@ -2031,12 +2423,22 @@ bool Library::CallPythonScript(const std::string& scriptName, const std::vector<
 
     if (!pipe) {
         std::cout << "Failed to execute Python script" << std::endl;
+        output = "Failed to start process";
         return false;
     }
 
-    char buffer[128];
-    while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-        output += buffer;
+    char buffer[1024];
+    output.clear();
+
+    try {
+        while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+            output += buffer;
+            // Also print to console for debugging
+            std::cout << "Python output: " << buffer;
+        }
+    }
+    catch (const std::exception& e) {
+        std::cout << "Exception reading Python output: " << e.what() << std::endl;
     }
 
 #ifdef _WIN32
@@ -2045,6 +2447,11 @@ bool Library::CallPythonScript(const std::string& scriptName, const std::vector<
     int result = pclose(pipe);
 #endif
 
+    if (result != 0) {
+        std::cout << "Python script exited with code: " << result << std::endl;
+        std::cout << "Full output: " << output << std::endl;
+    }
+
     return result == 0;
 }
 
@@ -2052,51 +2459,130 @@ bool Library::CallPythonScriptAsync(const std::string& scriptName, const std::ve
     std::function<void(const std::string&)> progressCallback,
     std::function<void(bool, const std::string&)> completionCallback) {
 
-    std::string command = "python " + scriptName;
+    // Check if Python script exists
+    if (!std::filesystem::exists(scriptName)) {
+        std::cout << "Error: Python script not found: " << scriptName << std::endl;
+        completionCallback(false, "Python script not found");
+        return false;
+    }
+
+    // Build command with stderr redirection to capture progress
+    std::string command = "python \"" + scriptName + "\"";
     for (const auto& arg : args) {
         command += " \"" + arg + "\"";
     }
 
-    // IMPORTANT: Add "2>&1" to redirect stderr to stdout
+    // Redirect stderr to stdout so we can capture both streams
     command += " 2>&1";
 
-    std::cout << "Executing: " << command << std::endl;
+    // Extract novel name from args
+    std::string novelName;
+    for (size_t i = 0; i < args.size(); i++) {
+        if (args[i] == "--name" && i + 1 < args.size()) {
+            novelName = args[i + 1];
+            break;
+        }
+    }
 
-    // Run in separate thread to avoid blocking UI
-    std::thread([command, progressCallback, completionCallback]() {
+    if (novelName.empty()) {
+        completionCallback(false, "Could not extract novel name");
+        return false;
+    }
+
+    std::cout << "Starting download for: " << novelName << std::endl;
+    std::cout << "Command: " << command << std::endl;
+
+    // Create download entry
+    ActiveDownload download;
+    download.novelName = novelName;
+    download.novelDir = "Novels/" + novelName;
+    download.isActive = true;
+
+    // Create thread
+    download.thread = std::make_shared<std::thread>([this, command, novelName, progressCallback, completionCallback]() {
         std::string output;
+        std::string line;
 
+        try {
 #ifdef _WIN32
-        FILE* pipe = _popen(command.c_str(), "r");
+            FILE* pipe = _popen(command.c_str(), "r");
 #else
-        FILE* pipe = popen(command.c_str(), "r");
+            FILE* pipe = popen(command.c_str(), "r");
 #endif
 
-        if (!pipe) {
-            completionCallback(false, "Failed to execute Python script");
-            return;
-        }
-
-        char buffer[256];
-        while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-            std::string line(buffer);
-            output += line;
-
-            // Call progress callback for each line (real-time updates)
-            if (progressCallback) {
-                progressCallback(line);
+            if (!pipe) {
+                // Remove from active downloads
+                {
+                    std::lock_guard<std::mutex> lock(activeDownloadsMutex);
+                    activeDownloads.erase(
+                        std::remove_if(activeDownloads.begin(), activeDownloads.end(),
+                            [novelName](const ActiveDownload& d) { return d.novelName == novelName; }),
+                        activeDownloads.end());
+                }
+                completionCallback(false, "Failed to start Python process");
+                return;
             }
-        }
+
+            char buffer[256];
+            while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+                std::string line(buffer);
+                output += line;
+
+                // Debug output
+                std::cout << "Python: " << line;
+
+                // Parse progress lines
+                if (line.find("Progress:") != std::string::npos) {
+                    if (progressCallback) {
+                        progressCallback(line);
+                    }
+                }
+                // Also check for error messages
+                else if (line.find("Error") != std::string::npos ||
+                    line.find("error") != std::string::npos ||
+                    line.find("Failed") != std::string::npos) {
+                    std::cout << "Error detected: " << line;
+                }
+            }
 
 #ifdef _WIN32
-        int result = _pclose(pipe);
+            int result = _pclose(pipe);
 #else
-        int result = pclose(pipe);
+            int result = pclose(pipe);
 #endif
 
-        // Call completion callback when done
-        completionCallback(result == 0, output);
-        }).detach();
+            // Remove from active downloads
+            {
+                std::lock_guard<std::mutex> lock(activeDownloadsMutex);
+                activeDownloads.erase(
+                    std::remove_if(activeDownloads.begin(), activeDownloads.end(),
+                        [novelName](const ActiveDownload& d) { return d.novelName == novelName; }),
+                    activeDownloads.end());
+            }
+
+            // Check if download was successful
+            bool success = (result == 0);
+
+            // Also check output for success indicators
+            if (output.find("download complete") != std::string::npos ||
+                output.find("Successfully downloaded") != std::string::npos) {
+                success = true;
+            }
+
+            completionCallback(success, output);
+            std::cout << "Download thread completed for: " << novelName << " Success: " << success << std::endl;
+        }
+        catch (const std::exception& e) {
+            std::cout << "Exception in download thread: " << e.what() << std::endl;
+            completionCallback(false, std::string("Exception: ") + e.what());
+        }
+        });
+
+    // Add to active downloads
+    {
+        std::lock_guard<std::mutex> lock(activeDownloadsMutex);
+        activeDownloads.push_back(std::move(download));
+    }
 
     return true;
 }
@@ -2147,11 +2633,48 @@ bool Library::ParseSearchResults(const std::string& output) {
     }
     catch (const std::exception& e) {
         std::cout << "Error parsing search results: " << e.what() << std::endl;
+        // Try to print the raw output for debugging
+        std::cout << "Raw output: " << output << std::endl;
         return false;
     }
 }
 
 void Library::StartDownload(const SearchResult& result, int startChapter, int endChapter) {
+    // Create the novel entry immediately when download starts
+    Novel newNovel;
+    newNovel.name = result.title;
+    newNovel.authorname = result.author;
+    newNovel.synopsis = result.description;
+    newNovel.totalchapters = result.totalChapters;
+    newNovel.downloadedchapters = 0; // Start with 0, will update as chapters download
+    newNovel.progress.readchapters = 0;
+    newNovel.progress.progresspercentage = 0.0f;
+
+    // Set cover path (will be downloaded by Python script)
+    newNovel.coverpath = "Novels/" + result.title + "/cover.jpg";
+
+    // Check if novel already exists in the list
+    bool novelExists = false;
+    for (auto& existing : novellist) {
+        if (existing.name == result.title && existing.authorname == result.author) {
+            novelExists = true;
+            // Update existing novel info
+            existing.totalchapters = result.totalChapters;
+            existing.synopsis = result.description;
+            break;
+        }
+    }
+
+    // Add novel to list if it doesn't exist
+    if (!novelExists) {
+        novellist.push_back(newNovel);
+        std::cout << "Added novel to library: " << result.title << std::endl;
+    }
+
+    // Save the updated novel list immediately
+    SaveNovels(novellist);
+
+    // Create and queue the download task
     DownloadTask task = CreateDownloadTask(result, startChapter, endChapter);
     downloadQueue.push_back(task);
 
@@ -2159,14 +2682,15 @@ void Library::StartDownload(const SearchResult& result, int startChapter, int en
         StartDownloadManager();
     }
 
-    std::cout << "Added download task: " << result.title << std::endl;
+    std::cout << "Started download task: " << result.title << std::endl;
 }
 
 Library::DownloadTask Library::CreateDownloadTask(const SearchResult& result, int startChapter, int endChapter) {
     DownloadTask task;
+    task.downloadId = GenerateDownloadId(result.title, ContentType::NOVEL);
     task.novelName = result.title;
     task.author = result.author;
-    task.sourceUrl = result.url;
+    task.sourceUrl = result.url; // This should be the full URL from search
     task.sourceName = result.sourceName;
     task.startChapter = startChapter;
     task.endChapter = endChapter;
@@ -2177,32 +2701,325 @@ Library::DownloadTask Library::CreateDownloadTask(const SearchResult& result, in
     task.isComplete = false;
     task.status = "Queued";
     task.progress = 0.0f;
+    task.lastError = "";
+    task.contentType = ContentType::NOVEL;
+
+    std::cout << "Created download task for: " << task.novelName
+        << " URL: " << task.sourceUrl << std::endl;
+
     return task;
 }
-
 void Library::StartDownloadManager() {
     downloadManagerRunning = true;
     downloadThread = std::make_unique<std::thread>(&Library::ProcessDownloadQueue, this);
 }
 
-void Library::StopDownloadManager() {
-    downloadManagerRunning = false;
-    if (downloadThread && downloadThread->joinable()) {
-        downloadThread->join();
+void Library::SaveDownloadStates() {
+    try {
+        std::filesystem::create_directories("downloads");
+
+        json j;
+        json downloadsArray = json::array();
+
+        std::lock_guard<std::mutex> lock(downloadStateMutex);
+        for (const auto& state : persistentDownloadStates) {
+            json stateJson;
+            stateJson["id"] = state.id;
+            stateJson["contentName"] = state.contentName;
+            stateJson["type"] = static_cast<int>(state.type);
+            stateJson["currentChapter"] = state.currentChapter;
+            stateJson["totalChapters"] = state.totalChapters;
+            stateJson["isPaused"] = state.isPaused;
+            stateJson["isComplete"] = state.isComplete;
+            stateJson["progress"] = state.progress;
+            stateJson["lastError"] = state.lastError;
+
+            auto time_t = std::chrono::system_clock::to_time_t(state.lastUpdate);
+            stateJson["lastUpdate"] = time_t;
+
+            downloadsArray.push_back(stateJson);
+        }
+
+        j["downloads"] = downloadsArray;
+
+        std::ofstream file("downloads/download_states.json");
+        if (file.is_open()) {
+            file << j.dump(4);
+            file.close();
+        }
+    }
+    catch (const std::exception& e) {
+        std::cout << "Error saving download states: " << e.what() << std::endl;
     }
 }
 
-void Library::ProcessDownloadQueue() {
-    while (downloadManagerRunning) {
-        bool hasActiveDownload = ProcessNextDownload();
+void Library::LoadDownloadStates() {
+    try {
+        std::ifstream file("downloads/download_states.json");
+        if (!file.is_open()) return;
 
+        json j;
+        file >> j;
+        file.close();
+
+        std::lock_guard<std::mutex> lock(downloadStateMutex);
+        persistentDownloadStates.clear();
+
+        if (j.contains("downloads")) {
+            for (const auto& stateJson : j["downloads"]) {
+                DownloadState state;
+                state.id = stateJson.value("id", "");
+                state.contentName = stateJson.value("contentName", "");
+                state.type = static_cast<ContentType>(stateJson.value("type", 0));
+                state.currentChapter = stateJson.value("currentChapter", 0);
+                state.totalChapters = stateJson.value("totalChapters", 0);
+                state.isPaused = stateJson.value("isPaused", false);
+                state.isComplete = stateJson.value("isComplete", false);
+                state.progress = stateJson.value("progress", 0.0f);
+                state.lastError = stateJson.value("lastError", "");
+
+                auto time_t = stateJson.value("lastUpdate", std::time_t{ 0 });
+                state.lastUpdate = std::chrono::system_clock::from_time_t(time_t);
+
+                persistentDownloadStates.push_back(state);
+
+                // Auto-resume incomplete downloads
+                if (!state.isComplete && !state.isPaused) {
+                    ResumeDownload(state.id);
+                }
+            }
+        }
+    }
+    catch (const std::exception& e) {
+        std::cout << "Error loading download states: " << e.what() << std::endl;
+    }
+}
+
+void Library::QueueDownloadResume(const DownloadState& state) {
+    // Create a resume task and add to download queue
+    std::cout << "Queueing download resume for: " << state.contentName << std::endl;
+
+    // Find the content item to get source info
+    auto contentIt = std::find_if(contentLibrary.begin(), contentLibrary.end(),
+        [&state](const ContentItem& item) { return item.name == state.contentName; });
+
+    if (contentIt != contentLibrary.end()) {
+        // Create download task from saved state
+        DownloadTask task;
+        task.novelName = state.contentName;
+        task.sourceName = contentIt->sourceName;
+        task.sourceUrl = contentIt->sourceUrl;
+        task.startChapter = state.currentChapter + 1; // Resume from next chapter
+        task.endChapter = state.totalChapters;
+        task.currentChapter = state.currentChapter;
+        task.totalChapters = state.totalChapters;
+        task.isActive = false;
+        task.isPaused = false;
+        task.isComplete = false;
+        task.status = "Resuming";
+        task.progress = state.progress;
+
+        downloadQueue.push_back(task);
+
+        if (!downloadManagerRunning) {
+            StartDownloadManager();
+        }
+    }
+}
+
+void Library::CleanupPartialDownload(const std::string& downloadId, const std::string& contentName, ContentType type) {
+    try {
+        std::string baseDir;
+        if (type == ContentType::NOVEL) {
+            baseDir = "Novels/" + contentName;
+        }
+        else {
+            baseDir = "Manga/" + contentName;
+        }
+
+        // Don't delete everything, just mark as cancelled
+        std::string cancelFile = baseDir + "/.cancelled";
+        std::ofstream file(cancelFile);
+        if (file.is_open()) {
+            file << "Download cancelled by user" << std::endl;
+            file.close();
+        }
+
+        std::cout << "Marked download as cancelled: " << contentName << std::endl;
+    }
+    catch (const std::exception& e) {
+        std::cout << "Error during cleanup: " << e.what() << std::endl;
+    }
+}
+
+// Search Functions
+bool Library::SearchContentWithFilters(const std::string& query, const SearchFilter& filter) {
+    if (query.empty()) return false;
+
+    isSearching = true;
+    searchResults.clear();
+    searchQuery = query;
+
+    std::vector<std::string> args = {
+        "search",
+        "--query", query,
+        "--content-type", ContentTypeToString(filter.contentType),
+        "--max-results", std::to_string(filter.maxResults),
+        "--config", "sources.json"
+    };
+
+    if (filter.showAdult) {
+        args.push_back("--include-adult");
+    }
+
+    if (!filter.language.empty()) {
+        args.push_back("--language");
+        args.push_back(filter.language);
+    }
+
+    std::string output;
+    bool success = CallPythonScript("download_manager.py", args, output);
+
+    if (success && !output.empty()) {
+        success = ParseSearchResults(output);
+    }
+
+    isSearching = false;
+    return success;
+}
+
+void Library::RenderContentTypeFilter(SearchFilter& filter) {
+    const char* types[] = { "All", "Novel", "Manga", "Manhwa", "Manhua" };
+    int currentType = static_cast<int>(filter.contentType);
+
+    ImGui::Text("Content Type:");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(120);
+    if (ImGui::Combo("##ContentType", &currentType, types, 5)) {
+        filter.contentType = static_cast<ContentType>(currentType);
+    }
+}
+
+void Library::RenderLanguageFilter(SearchFilter& filter) {
+    static char languageBuffer[32] = "";
+    if (filter.language.empty()) {
+        strcpy_s(languageBuffer, "");
+    }
+    else {
+        strcpy_s(languageBuffer, filter.language.c_str());
+    }
+
+    ImGui::Text("Language:");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(80);
+    if (ImGui::InputText("##Language", languageBuffer, sizeof(languageBuffer))) {
+        filter.language = std::string(languageBuffer);
+    }
+
+    ImGui::SameLine();
+    if (ImGui::Button("Clear##Lang")) {
+        filter.language.clear();
+        languageBuffer[0] = '\0';
+    }
+}
+
+std::string Library::ContentTypeToString(ContentType type) {
+    switch (type) {
+    case ContentType::ALL: return "all";
+    case ContentType::NOVEL: return "novel";
+    case ContentType::MANGA: return "manga";
+    case ContentType::MANHWA: return "manhwa";
+    case ContentType::MANHUA: return "manhua";
+    default: return "all";
+    }
+}
+
+Library::ContentType Library::StringToContentType(const std::string& str) {
+    if (str == "novel") return ContentType::NOVEL;
+    if (str == "manga") return ContentType::MANGA;
+    if (str == "manhwa") return ContentType::MANHWA;
+    if (str == "manhua") return ContentType::MANHUA;
+    return ContentType::ALL;
+}
+
+
+void Library::StopDownloadManager() {
+    shouldTerminateDownloads = true;
+    downloadManagerRunning = false;
+
+    // Create stop signals for all active downloads
+    {
+        std::lock_guard<std::mutex> lock(activeDownloadsMutex);
+        for (const auto& download : activeDownloads) {
+            if (download.isActive) {
+                std::string stopSignalFile = "Novels/.stop_" + download.novelName;
+                std::replace(stopSignalFile.begin(), stopSignalFile.end(), ' ', '_');
+                std::ofstream stopFile(stopSignalFile);
+                if (stopFile.is_open()) {
+                    stopFile << "SHUTDOWN" << std::endl;
+                    stopFile.close();
+                }
+            }
+        }
+    }
+
+    // Stop main download manager thread
+    if (downloadThread && downloadThread->joinable()) {
+        downloadThread->join();
+    }
+    downloadThread.reset();
+
+    std::cout << "Download manager stopped" << std::endl;
+}
+
+void Library::ProcessDownloadQueue() {
+    while (downloadManagerRunning && !shouldTerminateDownloads) {
+        bool hasActiveDownload = false;
+        bool processedNewDownload = false;
+
+        // Check for downloads that need to be started/resumed
+        for (auto& task : downloadQueue) {
+            if (task.isComplete || task.isPaused) {
+                continue;
+            }
+
+            if (task.isActive) {
+                hasActiveDownload = true;
+                continue;
+            }
+
+            // Start queued downloads
+            if (!task.isPaused && (task.status == "Queued" || task.status == "Starting")) {
+                std::cout << "Starting queued download: " << task.novelName << std::endl;
+                bool started = ExecuteDownloadTask(task);
+                if (started) {
+                    hasActiveDownload = true;
+                    processedNewDownload = true;
+                    break; // Only start one at a time
+                }
+            }
+        }
+
+        // Clean up completed downloads from the queue
+        downloadQueue.erase(
+            std::remove_if(downloadQueue.begin(), downloadQueue.end(),
+                [](const DownloadTask& task) {
+                    return task.isComplete && task.status == "Complete";
+                }),
+            downloadQueue.end()
+        );
+
+        // If no active downloads and no queued downloads, stop the manager
         if (!hasActiveDownload && !HasQueuedDownloads()) {
             downloadManagerRunning = false;
             break;
         }
 
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+        // Sleep for a bit before checking again
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
+
+    std::cout << "Download queue processing stopped" << std::endl;
 }
 
 bool Library::ProcessNextDownload() {
@@ -2218,87 +3035,223 @@ bool Library::ProcessNextDownload() {
     return false;
 }
 
-void Library::ParseProgressLine(const std::string& line) {
-    // Remove newline characters
-    std::string cleanLine = line;
-    cleanLine.erase(std::remove(cleanLine.begin(), cleanLine.end(), '\n'), cleanLine.end());
-    cleanLine.erase(std::remove(cleanLine.begin(), cleanLine.end(), '\r'), cleanLine.end());
+void Library::ParseProgressLine(const std::string& line, DownloadTask& task) {
+    // Debug output
+    std::cout << "Parsing progress line: " << line << std::endl;
 
-    // Parse "Progress: 1/50 (2.0%) - Chapter 1: Title"
-    if (cleanLine.find("Progress: ") == 0) {
+    // Parse "Progress: X/Y (Z%) - Chapter Title"
+    std::regex progressRegex(R"(Progress:\s*(\d+)/(\d+)\s*\(([0-9.]+)%\))");
+    std::smatch match;
+
+    if (std::regex_search(line, match, progressRegex)) {
         try {
-            // Find the pattern: Progress: X/Y (Z.Z%) - Chapter Title
-            size_t colonPos = cleanLine.find(": ");
-            if (colonPos == std::string::npos) return;
+            task.currentChapter = std::stoi(match[1]);
+            int totalChapters = std::stoi(match[2]);
+            task.progress = std::stof(match[3]);
 
-            size_t slashPos = cleanLine.find("/", colonPos);
-            if (slashPos == std::string::npos) return;
+            // Update total chapters if different
+            if (totalChapters > 0) {
+                task.totalChapters = totalChapters;
+            }
 
-            size_t openParenPos = cleanLine.find(" (", slashPos);
-            if (openParenPos == std::string::npos) return;
+            std::cout << "Parsed progress: " << task.currentChapter << "/" << task.totalChapters
+                << " (" << task.progress << "%)" << std::endl;
 
-            size_t closeParenPos = cleanLine.find("%) - ", openParenPos);
-            if (closeParenPos == std::string::npos) return;
+            // Update persistent state
+            DownloadState state;
+            state.id = task.downloadId;
+            state.contentName = task.novelName;
+            state.type = task.contentType;
+            state.currentChapter = task.currentChapter;
+            state.totalChapters = task.totalChapters;
+            state.progress = task.progress;
+            state.isPaused = false;
+            state.isComplete = false;
+            state.lastUpdate = std::chrono::system_clock::now();
 
-            // Extract current chapter number
-            std::string currentStr = cleanLine.substr(colonPos + 2, slashPos - colonPos - 2);
-            downloadprogress.current = std::stoi(currentStr);
-
-            // Extract total chapters
-            std::string totalStr = cleanLine.substr(slashPos + 1, openParenPos - slashPos - 1);
-            downloadprogress.total = std::stoi(totalStr);
-
-            // Extract percentage
-            std::string percentStr = cleanLine.substr(openParenPos + 2, closeParenPos - openParenPos - 2);
-            downloadprogress.percentage = std::stof(percentStr);
-
-            // Extract chapter title
-            downloadprogress.chapterTitle = cleanLine.substr(closeParenPos + 4);
-
-            std::cout << "Progress parsed: " << downloadprogress.current << "/"
-                << downloadprogress.total << " (" << downloadprogress.percentage
-                << "%) - " << downloadprogress.chapterTitle << std::endl;
-
+            UpdateDownloadState(task.downloadId, state);
         }
         catch (const std::exception& e) {
-            std::cout << "Error parsing progress line: " << e.what() << std::endl;
+            std::cout << "Error parsing progress numbers: " << e.what() << std::endl;
         }
     }
-
-    else if (cleanLine.find("Download completed") != std::string::npos) {
-        std::cout << "Download completed successfully" << std::endl;
-        downloadprogress.isComplete = true;
+    else {
+        // Check for error messages
+        if (line.find("Error") != std::string::npos || line.find("error") != std::string::npos) {
+            task.lastError = line;
+            std::cout << "Error detected in output: " << line << std::endl;
+        }
+        // Check for completion message
+        else if (line.find("download complete") != std::string::npos ||
+            line.find("Download completed successfully") != std::string::npos) {
+            task.isComplete = true;
+            task.status = "Complete";
+            task.progress = 100.0f;
+        }
     }
 }
 
 bool Library::ExecuteDownloadTask(DownloadTask& task) {
+    if (shouldTerminateDownloads) {
+        return false;
+    }
+
     task.isActive = true;
     task.status = "Downloading";
 
+    // Generate unique download ID
+    if (task.downloadId.empty()) {
+        task.downloadId = GenerateDownloadId(task.novelName, task.contentType);
+    }
+
+    std::cout << "ExecuteDownloadTask:" << std::endl;
+    std::cout << "  Novel: " << task.novelName << std::endl;
+    std::cout << "  Source: " << task.sourceName << std::endl;
+    std::cout << "  URL: " << task.sourceUrl << std::endl;
+    std::cout << "  Chapters: " << task.startChapter << " to " << task.endChapter << std::endl;
+
     std::vector<std::string> args = BuildDownloadArgs(task);
-    std::string output;
 
-    downloadprogress.reset();
-    downloadprogress.isActive = true;
+    std::cout << "Python args: ";
+    for (const auto& arg : args) {
+        std::cout << arg << " ";
+    }
+    std::cout << std::endl;
 
-    CallPythonScriptAsync("download_manager.py", args,
-        // Progress callback (called for each line)
-        [this](const std::string& line) {
-            ParseProgressLine(line);
-        },
-        // Completion callback
-        [this](bool success, const std::string& output) {
-            downloadprogress.isActive = false;
-            downloadprogress.isComplete = success;
-            LoadAllNovelsFromFile();
-            if (!success) {
-                std::cout << "Download failed: " << output << std::endl;
-                return false;
+    // Add download ID
+    args.push_back("--download-id");
+    args.push_back(task.downloadId);
+
+    // Clean up any existing stop signals
+    std::string stopSignalFile = "downloads/.stop_" + task.downloadId;
+    if (std::filesystem::exists(stopSignalFile)) {
+        std::filesystem::remove(stopSignalFile);
+    }
+
+    std::cout << "Starting download: " << task.novelName << " (ID: " << task.downloadId << ")" << std::endl;
+
+    // Create a copy of task data for the lambda
+    std::string taskId = task.downloadId;
+    std::string taskName = task.novelName;
+    ContentType taskType = task.contentType;
+
+    // Store the thread in a way that prevents the crash
+    std::lock_guard<std::mutex> lock(downloadStateMutex);
+
+    // Create process info BEFORE creating the thread
+    ProcessInfo processInfo;
+    processInfo.contentName = taskName;
+    processInfo.contentType = taskType;
+    processInfo.shouldStop.store(false);
+    processInfo.shouldTerminate.store(false);
+
+    // Create thread directly
+    auto downloadThread = std::make_shared<std::thread>([this, args, taskId, taskName, taskType, &task]() {
+        try {
+            std::string command = "python \"download_manager.py\"";
+            for (const auto& arg : args) {
+                command += " \"" + arg + "\"";
             }
+
+            // Redirect stderr to stdout to capture progress
+            command += " 2>&1";
+
+            std::cout << "Executing command: " << command << std::endl;
+
+#ifdef _WIN32
+            FILE* pipe = _popen(command.c_str(), "r");
+#else
+            FILE* pipe = popen(command.c_str(), "r");
+#endif
+
+            if (!pipe) {
+                std::cout << "Failed to open pipe!" << std::endl;
+                task.isActive = false;
+                task.status = "Failed";
+                task.lastError = "Failed to start Python process";
+                return;
+            }
+
+            char buffer[256];
+            while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+                std::string line(buffer);
+
+                // Debug output
+                std::cout << "Python output: " << line;
+
+                // Parse progress lines
+                if (line.find("Progress:") != std::string::npos) {
+                    ParseProgressLine(line, task);
+                }
+                // Check for completion
+                else if (line.find("download complete") != std::string::npos ||
+                    line.find("Successfully downloaded") != std::string::npos) {
+                    task.progress = 100.0f;
+                    task.isComplete = true;
+                    task.status = "Complete";
+                }
+                // Check for errors
+                else if (line.find("Error") != std::string::npos &&
+                    line.find("Error loading sources") == std::string::npos) {
+                    task.lastError = line;
+                }
+            }
+
+#ifdef _WIN32
+            int result = _pclose(pipe);
+#else
+            int result = pclose(pipe);
+#endif
+
+            task.isActive = false;
+
+            if (result == 0 && task.progress > 0) {
+                task.isComplete = true;
+                task.status = "Complete";
+
+                // Update download state
+                DownloadState state;
+                state.id = taskId;
+                state.contentName = taskName;
+                state.type = taskType;
+                state.currentChapter = task.currentChapter;
+                state.totalChapters = task.totalChapters;
+                state.isComplete = true;
+                state.progress = task.progress;
+                state.lastUpdate = std::chrono::system_clock::now();
+                UpdateDownloadState(taskId, state);
+
+                // Refresh library
+                RefreshNovelChapterCounts();
+                LoadAllNovelsFromFile();
+            }
+            else if (!task.isComplete) {
+                task.status = "Failed";
+                if (task.lastError.empty()) {
+                    task.lastError = "Download process failed";
+                }
+            }
+
+            std::cout << "Download thread completed. Status: " << task.status << std::endl;
+
         }
-    );
+        catch (const std::exception& e) {
+            std::cout << "Exception in download thread: " << e.what() << std::endl;
+            task.isActive = false;
+            task.status = "Failed";
+            task.lastError = e.what();
+        }
+        });
+
+    // Assign thread to process info
+    processInfo.thread = downloadThread;
+
+    // Store in map
+    activeProcesses[task.downloadId] = std::move(processInfo);
+
     return true;
 }
+
 
 std::vector<std::string> Library::BuildDownloadArgs(const DownloadTask& task) {
     std::vector<std::string> args = {
@@ -2308,16 +3261,15 @@ std::vector<std::string> Library::BuildDownloadArgs(const DownloadTask& task) {
         "--start", std::to_string(task.startChapter)
     };
 
-    // Check if we have a full URL or just a novel name
-    if (IsFullUrl(task.sourceUrl)) {
-        // Use the full URL
+    // Check if sourceUrl is actually a URL or just a name
+    if (task.sourceUrl.find("http") == 0) {
         args.push_back("--url");
         args.push_back(task.sourceUrl);
     }
     else {
-        // Use novel name (will be converted to URL by Python script)
+        // It's likely just a novel name
         args.push_back("--name");
-        args.push_back(task.sourceUrl); // This actually contains the novel name
+        args.push_back(task.novelName);
     }
 
     // Add end chapter if specified
@@ -2342,29 +3294,186 @@ bool Library::HasQueuedDownloads() {
     return false;
 }
 
-void Library::PauseDownload(int taskIndex) {
-    if (IsValidTaskIndex(taskIndex)) {
-        downloadQueue[taskIndex].isPaused = true;
-        downloadQueue[taskIndex].status = "Paused";
+void Library::PauseDownload(const std::string& downloadId) {
+    std::lock_guard<std::mutex> lock(downloadStateMutex);
+
+    auto it = std::find_if(persistentDownloadStates.begin(), persistentDownloadStates.end(),
+        [&downloadId](const DownloadState& state) { return state.id == downloadId; });
+
+    if (it != persistentDownloadStates.end()) {
+        it->isPaused = true;
+        SaveDownloadStates();
+
+        // Send signal to python process
+        auto processIt = activeProcesses.find(downloadId);
+        if (processIt != activeProcesses.end()) {
+            processIt->second.shouldStop.store(true);
+        }
+
+        // Create pause signal file
+        std::filesystem::create_directories("downloads");
+        std::string pauseFile = "downloads/.pause_" + downloadId;
+        std::ofstream file(pauseFile);
+        if (file.is_open()) {
+            file << "PAUSE" << std::endl;
+            file.close();
+        }
+
+        std::cout << "Paused download: " << downloadId << std::endl;
     }
 }
 
-void Library::ResumeDownload(int taskIndex) {
-    if (IsValidTaskIndex(taskIndex)) {
-        downloadQueue[taskIndex].isPaused = false;
-        downloadQueue[taskIndex].status = "Queued";
+void Library::ResumeDownload(const std::string& downloadId) {
+    std::lock_guard<std::mutex> lock(downloadStateMutex);
+
+    auto it = std::find_if(persistentDownloadStates.begin(), persistentDownloadStates.end(),
+        [&downloadId](const DownloadState& state) { return state.id == downloadId; });
+
+    if (it != persistentDownloadStates.end() && it->isPaused) {
+        it->isPaused = false;
+        it->lastError.clear();
+        SaveDownloadStates();
+
+        // Remove pause signal
+        std::string pauseFile = "downloads/.pause_" + downloadId;
+        if (std::filesystem::exists(pauseFile)) {
+            std::filesystem::remove(pauseFile);
+        }
+
+        // Queue for resumption
+        QueueDownloadResume(*it);
+
+        std::cout << "Resumed download: " << downloadId << std::endl;
     }
 }
 
-void Library::CancelDownload(int taskIndex) {
-    if (IsValidTaskIndex(taskIndex)) {
-        downloadQueue[taskIndex].isComplete = true;
-        downloadQueue[taskIndex].status = "Cancelled";
+std::string Library::GenerateDownloadId(const std::string& contentName, ContentType type) {
+    auto now = std::chrono::system_clock::now();
+    auto time_t = std::chrono::system_clock::to_time_t(now);
+
+    std::string typeStr = ContentTypeToString(type);
+    std::string sanitized = std::regex_replace(contentName, std::regex("[^a-zA-Z0-9]"), "_");
+
+    return typeStr + "_" + sanitized + "_" + std::to_string(time_t);
+}
+
+void Library::UpdateDownloadState(const std::string& downloadId, const DownloadState& state) {
+    std::lock_guard<std::mutex> lock(downloadStateMutex);
+
+    // Find or create state
+    auto it = std::find_if(persistentDownloadStates.begin(), persistentDownloadStates.end(),
+        [&downloadId](const DownloadState& s) { return s.id == downloadId; });
+
+    if (it != persistentDownloadStates.end()) {
+        *it = state;
+    }
+    else {
+        persistentDownloadStates.push_back(state);
+    }
+
+    // Save periodically
+    static auto lastSave = std::chrono::steady_clock::now();
+    auto now = std::chrono::steady_clock::now();
+    if (std::chrono::duration_cast<std::chrono::seconds>(now - lastSave).count() > 5) {
+        SaveDownloadStates();
+        lastSave = now;
+    }
+}
+
+void Library::SaveAllReadingPositions() {
+    try {
+        // Ensure directory exists
+        std::filesystem::create_directories("reading_positions");
+
+        // Save each reading position
+        for (const auto& [contentName, position] : readingPositions) {
+            // Skip empty entries
+            if (contentName.empty()) continue;
+
+            json j;
+            j["contentName"] = position.contentName;
+            j["type"] = static_cast<int>(position.type);
+            j["currentChapter"] = position.currentChapter;
+            j["scrollPosition"] = position.scrollPosition;
+            j["currentPage"] = position.currentPage;
+            j["lastRead"] = static_cast<int64_t>(position.lastRead);
+
+            // Create filename from content name (sanitized)
+            std::string filename = "reading_positions/" +
+                std::regex_replace(contentName, std::regex("[^a-zA-Z0-9]"), "_") + ".json";
+
+            std::ofstream file(filename);
+            if (file.is_open()) {
+                file << j.dump(4);
+                file.close();
+            }
+            else {
+                std::cout << "Failed to save reading position for: " << contentName << std::endl;
+            }
+        }
+
+        std::cout << "Saved " << readingPositions.size() << " reading positions" << std::endl;
+    }
+    catch (const std::exception& e) {
+        std::cout << "Error saving all reading positions: " << e.what() << std::endl;
+    }
+}
+
+void Library::CancelDownload(const std::string& downloadId) {
+    std::lock_guard<std::mutex> lock(downloadStateMutex);
+
+    auto it = std::find_if(persistentDownloadStates.begin(), persistentDownloadStates.end(),
+        [&downloadId](const DownloadState& state) { return state.id == downloadId; });
+
+    if (it != persistentDownloadStates.end()) {
+        it->isComplete = true;
+        it->lastError = "Cancelled by user";
+        SaveDownloadStates();
+
+        // Terminate process
+        auto processIt = activeProcesses.find(downloadId);
+        if (processIt != activeProcesses.end()) {
+            processIt->second.shouldTerminate.store(true);
+        }
+
+        // Create cancel signal file
+        std::filesystem::create_directories("downloads");
+        std::string cancelFile = "downloads/.cancel_" + downloadId;
+        std::ofstream file(cancelFile);
+        if (file.is_open()) {
+            file << "CANCEL" << std::endl;
+            file.close();
+        }
+
+        // Clean up partial downloads
+        CleanupPartialDownload(downloadId, it->contentName, it->type);
+
+        std::cout << "Cancelled download: " << downloadId << std::endl;
     }
 }
 
 bool Library::IsValidTaskIndex(int taskIndex) {
     return taskIndex >= 0 && taskIndex < static_cast<int>(downloadQueue.size());
+}
+
+void Library::CleanupStopSignals() {
+    try {
+        std::filesystem::path novelsDir = "Novels";
+        if (std::filesystem::exists(novelsDir)) {
+            for (const auto& entry : std::filesystem::directory_iterator(novelsDir)) {
+                if (entry.is_regular_file()) {
+                    std::string filename = entry.path().filename().string();
+                    if (filename.starts_with(".stop_")) {
+                        std::filesystem::remove(entry.path());
+                        std::cout << "Cleaned up stop signal: " << filename << std::endl;
+                    }
+                }
+            }
+        }
+    }
+    catch (const std::exception& e) {
+        std::cout << "Error cleaning up stop signals: " << e.what() << std::endl;
+    }
 }
 
 // ============================================================================
@@ -2406,6 +3515,10 @@ void Library::RenderSearchTab() {
 
 void Library::RenderSearchInput() {
     static char searchBuffer[256] = "";
+
+    ImGui::BeginGroup();
+
+    // Search input line
     ImGui::Text("Search Query:");
     ImGui::SetNextItemWidth(300);
     ImGui::InputText("##SearchQuery", searchBuffer, sizeof(searchBuffer));
@@ -2414,7 +3527,7 @@ void Library::RenderSearchInput() {
     if (ImGui::Button("Search", ImVec2(80, 0)) && strlen(searchBuffer) > 0) {
         searchQuery = std::string(searchBuffer);
         std::thread([this]() {
-            SearchNovels(searchQuery);
+            SearchContentWithFilters(searchQuery, currentSearchFilter);
             }).detach();
     }
 
@@ -2422,6 +3535,13 @@ void Library::RenderSearchInput() {
     if (isSearching) {
         ImGui::Text("Searching...");
     }
+
+    ImGui::Spacing();
+
+    // Render filters
+    RenderSearchFilters();
+
+    ImGui::EndGroup();
 
     ImGui::Spacing();
     ImGui::Separator();
@@ -2479,6 +3599,24 @@ void Library::RenderResultCardContent(const SearchResult& result) {
     }
 }
 
+int Library::FindAvailableDownloadSlot() {
+    for (int i = 0; i < MAX_CONCURRENT_DOWNLOADS; i++) {
+        if (!downloadProgresses[i].isActive && !downloadProgresses[i].isComplete) {
+            return i;
+        }
+    }
+    return -1; // No available slots
+}
+
+int Library::FindDownloadSlotByTitle(const std::string& novelTitle) {
+    for (int i = 0; i < MAX_CONCURRENT_DOWNLOADS; i++) {
+        if (downloadProgresses[i].novelTitle == novelTitle) {
+            return i;
+        }
+    }
+    return -1; // Not found
+}
+
 void Library::RenderDownloadOptions(const SearchResult& result, size_t index) {
     ImGui::BeginGroup();
     {
@@ -2516,29 +3654,60 @@ void Library::RenderDownloadOptions(const SearchResult& result, size_t index) {
         }
         ImGui::PopStyleColor(4);
 
-        if (downloadprogress.isActive) {
-            ImGui::Text("Downloading: %d/%d chapters (%.1f%%)",
-                downloadprogress.current,
-                downloadprogress.total,
-                downloadprogress.percentage);
+        bool hasActiveDownloads = false;
 
-            if (downloadprogress.total > 0) {
-                ImGui::ProgressBar(downloadprogress.percentage / 100.0f);
-            }
-            else {
-                ImGui::ProgressBar(0.0f, ImVec2(-1.0f, 0.0f), "Initializing...");
-            }
+        for (int i = 0; i < MAX_CONCURRENT_DOWNLOADS; i++) {
+            const auto& progress = downloadProgresses[i];
 
-            if (!downloadprogress.chapterTitle.empty()) {
-                ImGui::Text("Current: %s", downloadprogress.chapterTitle.c_str());
+            if (progress.isActive || progress.isComplete || progress.hasError) {
+                hasActiveDownloads = true;
+
+                ImGui::PushID(i);
+                ImGui::BeginGroup();
+
+                // Novel title header
+                ImGui::TextColored(ImVec4(0.8f, 0.8f, 1.0f, 1.0f), "Download %d: %s", i + 1,
+                    progress.novelTitle.empty() ? "Unknown" : progress.novelTitle.c_str());
+
+                if (progress.isActive) {
+                    ImGui::Text("Progress: %d/%d chapters (%.1f%%)",
+                        progress.current, progress.total, progress.percentage);
+
+                    if (progress.total > 0) {
+                        ImGui::ProgressBar(progress.percentage / 100.0f, ImVec2(-1.0f, 0.0f));
+                    }
+                    else {
+                        ImGui::ProgressBar(0.0f, ImVec2(-1.0f, 0.0f), "Initializing...");
+                    }
+
+                    if (!progress.chapterTitle.empty()) {
+                        ImGui::Text("Current: %s", progress.chapterTitle.c_str());
+                    }
+                }
+                else if (progress.hasError) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "Failed!");
+                    ImGui::Text("Error: %s", progress.errorMessage.c_str());
+
+                    if (ImGui::Button("Clear##clear")) {
+                        downloadProgresses[i].reset();
+                    }
+                }
+                else if (progress.isComplete) {
+                    ImGui::TextColored(ImVec4(0.2f, 0.8f, 0.2f, 1.0f), "Complete!");
+
+                    if (ImGui::Button("Clear##clear")) {
+                        downloadProgresses[i].reset();
+                    }
+                }
+
+                ImGui::EndGroup();
+                ImGui::PopID();
+                ImGui::Spacing();
             }
         }
-        else if (downloadprogress.isComplete) {
-            ImGui::TextColored(ImVec4(0.2f, 0.8f, 0.2f, 1.0f), "Download Complete!");
 
-            if (ImGui::Button("Clear")) {
-                downloadprogress.reset();
-            }
+        if (!hasActiveDownloads) {
+            ImGui::Text("No active downloads");
         }
 
         // Advanced Options Toggle
@@ -2667,15 +3836,16 @@ void Library::RenderDownloadTableRow(const DownloadTask& task, size_t index) {
 }
 
 void Library::RenderTaskProgress(const DownloadTask& task) {
-    float progress = task.progress;
     if (task.totalChapters > 0 && task.currentChapter > 0) {
-        progress = static_cast<float>(task.currentChapter) / static_cast<float>(task.totalChapters) * 100.0f;
+        float progress = (float)task.currentChapter / (float)task.totalChapters;
+        ImGui::ProgressBar(progress, ImVec2(-1, 0));
+        ImGui::Text("%d/%d chapters", task.currentChapter, task.totalChapters);
     }
-    ImGui::ProgressBar(progress / 100.0f, ImVec2(-1, 0), "");
-    ImGui::SameLine();
-    ImGui::Text("%.1f%%", progress);
+    else {
+        ImGui::ProgressBar(task.progress / 100.0f, ImVec2(-1, 0));
+        ImGui::Text("%.1f%%", task.progress);
+    }
 }
-
 void Library::RenderTaskStatus(const DownloadTask& task) {
     ImVec4 statusColor;
     if (task.isActive) {
@@ -2703,29 +3873,130 @@ void Library::RenderTaskChapterRange(const DownloadTask& task) {
     else {
         ImGui::Text("%d-All", task.startChapter);
     }
+
+    // Show current progress
+    if (task.isActive && task.currentChapter > 0) {
+        ImGui::Text("(Current: %d)", task.currentChapter);
+    }
 }
 
 void Library::RenderTaskActions(const DownloadTask& task, size_t index) {
     ImGui::PushID(static_cast<int>(index));
 
+    // Generate or get the download ID for this task
+    std::string downloadId = task.downloadId.empty() ?
+        GenerateDownloadId(task.novelName, StringToContentType("novel")) :
+        task.downloadId;
+
     if (!task.isComplete) {
         if (task.isPaused) {
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.7f, 0.2f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.3f, 0.8f, 0.3f, 1.0f));
             if (ImGui::SmallButton("Resume")) {
-                ResumeDownload(static_cast<int>(index));
+                ResumeDownload(downloadId);
+
+                // Update the task in the queue
+                auto& queueTask = downloadQueue[index];
+                queueTask.isPaused = false;
+                queueTask.status = "Resuming";
             }
+            ImGui::PopStyleColor(2);
+        }
+        else if (task.isActive) {
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.6f, 0.2f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.9f, 0.7f, 0.3f, 1.0f));
+            if (ImGui::SmallButton("Pause")) {
+                PauseDownload(downloadId);
+
+                // Update the task in the queue
+                auto& queueTask = downloadQueue[index];
+                queueTask.isPaused = true;
+                queueTask.status = "Pausing...";
+            }
+            ImGui::PopStyleColor(2);
         }
         else {
-            if (ImGui::SmallButton("Pause")) {
-                PauseDownload(static_cast<int>(index));
+            // Queued state
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.5f, 0.5f, 0.5f, 1.0f));
+            if (ImGui::SmallButton("Start")) {
+                // Force start this download
+                auto& queueTask = downloadQueue[index];
+                queueTask.status = "Starting...";
+
+                if (!downloadManagerRunning) {
+                    StartDownloadManager();
+                }
             }
+            ImGui::PopStyleColor();
         }
+
         ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.2f, 0.2f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.9f, 0.3f, 0.3f, 1.0f));
         if (ImGui::SmallButton("Cancel")) {
-            CancelDownload(static_cast<int>(index));
+            CancelDownload(downloadId);
+
+            // Mark task as complete in the queue
+            auto& queueTask = downloadQueue[index];
+            queueTask.isComplete = true;
+            queueTask.status = "Cancelled";
+        }
+        ImGui::PopStyleColor(2);
+
+        // Show retry button for failed downloads
+        if (!task.lastError.empty() && task.status == "Failed") {
+            ImGui::SameLine();
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.5f, 0.8f, 1.0f));
+            if (ImGui::SmallButton("Retry")) {
+                // Reset task for retry
+                auto& queueTask = downloadQueue[index];
+                queueTask.isComplete = false;
+                queueTask.isPaused = false;
+                queueTask.isActive = false;
+                queueTask.status = "Queued";
+                queueTask.progress = 0.0f;
+                queueTask.lastError.clear();
+
+                if (!downloadManagerRunning) {
+                    StartDownloadManager();
+                }
+            }
+            ImGui::PopStyleColor();
         }
     }
     else {
-        ImGui::Text("Done");
+        // Completed state
+        if (task.status == "Cancelled") {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.8f, 0.6f, 0.2f, 1.0f));
+            ImGui::Text("Cancelled");
+            ImGui::PopStyleColor();
+        }
+        else if (!task.lastError.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.8f, 0.2f, 0.2f, 1.0f));
+            ImGui::Text("Failed");
+            ImGui::PopStyleColor();
+
+            // Show error details on hover
+            if (ImGui::IsItemHovered()) {
+                ImGui::BeginTooltip();
+                ImGui::Text("Error: %s", task.lastError.c_str());
+                ImGui::EndTooltip();
+            }
+        }
+        else {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.2f, 0.8f, 0.2f, 1.0f));
+            ImGui::Text("Complete");
+            ImGui::PopStyleColor();
+        }
+
+        // Remove from queue button
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.6f, 0.6f, 0.6f, 1.0f));
+        if (ImGui::SmallButton("Remove")) {
+            // Remove this task from the download queue
+            downloadQueue.erase(downloadQueue.begin() + index);
+        }
+        ImGui::PopStyleColor();
     }
 
     ImGui::PopID();
@@ -2868,7 +4139,7 @@ Library::CoverTexture Library::CreateVulkanImage(int width, int height) {
     imageInfo.extent.depth = 1;
     imageInfo.mipLevels = 1;
     imageInfo.arrayLayers = 1;
-    imageInfo.format = VK_FORMAT_R8G8B8A8_SRGB;
+    imageInfo.format = VK_FORMAT_R8G8B8A8_UNORM; // Changed from SRGB
     imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
     imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
@@ -2924,7 +4195,7 @@ void Library::CreateImageView(CoverTexture& texture) {
     viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
     viewInfo.image = texture.image;
     viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    viewInfo.format = VK_FORMAT_R8G8B8A8_SRGB;
+    viewInfo.format = VK_FORMAT_R8G8B8A8_UNORM; // Changed from SRGB
     viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     viewInfo.subresourceRange.baseMipLevel = 0;
     viewInfo.subresourceRange.levelCount = 1;

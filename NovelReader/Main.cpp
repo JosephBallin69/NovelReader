@@ -21,15 +21,20 @@ int main() {
 
     Library library(&app);
 
+    // Load saved data
     library.LoadAllNovelsFromFile();
+    library.LoadAllReadingPositions();
+    library.LoadDownloadStates();
 
     app.SetUpdateCallback([&]() {
-
         library.Render();
-
         });
 
     app.Run();
+
+    // Save state before exit
+    library.SaveDownloadStates();
+    library.SaveAllReadingPositions();
 
     return 0;
 }

@@ -13,6 +13,10 @@
 #include <atomic>
 #include <memory>
 #include "Dependecies/stb_image.h"
+#include <array>
+#include <mutex>
+#include <Windows.h>
+#include <chrono>
 
 class Library {
 public:
@@ -54,7 +58,16 @@ public:
         }
     };
 
+
+    enum class ContentType {
+        ALL,
+        NOVEL,
+        MANGA,
+        MANHWA,
+        MANHUA
+    };
     struct DownloadTask {
+        std::string downloadId;      // Add this field
         std::string novelName;
         std::string author;
         std::string sourceUrl;
@@ -68,12 +81,18 @@ public:
         bool isComplete;
         std::string status;
         float progress;
+        std::string lastError;       // Add this field
+        ContentType contentType;     // Add this field
 
         // Default constructor
         DownloadTask() : startChapter(1), endChapter(-1), currentChapter(0), totalChapters(0),
-            isActive(false), isPaused(false), isComplete(false), progress(0.0f) {
+            isActive(false), isPaused(false), isComplete(false), progress(0.0f),
+            contentType(ContentType::NOVEL) {
+            downloadId = ""; // Will be generated when needed
         }
     };
+
+
 
     struct SearchResult {
         std::string title;
@@ -152,6 +171,21 @@ private:
     int currentLibraryTab = 0; // 0=Library, 1=Downloads
     bool showGrid = true; // true=grid view, false=list view
 
+
+    struct ActiveDownload {
+        std::string novelName;
+        std::string novelDir;
+        bool isActive;
+        std::shared_ptr<std::thread> thread;
+
+        ActiveDownload() : isActive(false) {}
+    };
+
+    bool shouldTerminateDownload;
+    bool shouldTerminateDownloads;
+    int activeDownloadCount;
+    std::vector<ActiveDownload> activeDownloads;
+
 public:
     Library(ImGuiApp::Application* application);
     ~Library();
@@ -197,6 +231,8 @@ public:
     void MarkNovelAsRead(const std::string& novelName);
     void UpdateReadingProgress(const std::string& novelName, int chapterNumber);
     void CheckAndDownloadLatestChapters(const Novel& novel);
+
+    std::mutex activeDownloadsMutex;
 
     // ============================================================================
     // Novel Grid/List Rendering
@@ -284,9 +320,9 @@ public:
     bool ExecuteDownloadTask(DownloadTask& task);
     std::vector<std::string> BuildDownloadArgs(const DownloadTask& task);
     bool HasQueuedDownloads();
-    void PauseDownload(int taskIndex);
-    void ResumeDownload(int taskIndex);
-    void CancelDownload(int taskIndex);
+    void PauseDownload(const std::string& downloadId);
+    void ResumeDownload(const std::string& downloadId);
+    void CancelDownload(const std::string& downloadId);
     bool IsValidTaskIndex(int taskIndex);
 
     // Download Queue UI
@@ -307,7 +343,9 @@ public:
     void RenderSourcesManagement();
     void AddNewDownloadSource();
 
-    void ParseProgressLine(const std::string& line);
+    void ParseProgressLine(const std::string& line, DownloadTask& task);
+
+    void CleanupStopSignals();
 
     bool CallPythonScriptAsync(const std::string& scriptName, const std::vector<std::string>& args,
         std::function<void(const std::string&)> progressCallback,
@@ -318,21 +356,194 @@ public:
         int total = 0;
         float percentage = 0.0f;
         std::string chapterTitle;
+        std::string novelTitle;  // Add novel title to identify which download
         bool isActive = false;
         bool isComplete = false;
+        bool hasError = false;
+        std::string errorMessage;
 
         void reset() {
             current = 0;
             total = 0;
             percentage = 0.0f;
             chapterTitle.clear();
+            novelTitle.clear();
             isActive = false;
             isComplete = false;
-        };
-
+            hasError = false;
+            errorMessage.clear();
+        }
     };
 
-    DownloadProgress downloadprogress;
+    static const int MAX_CONCURRENT_DOWNLOADS = 3;
+    std::array<DownloadProgress, MAX_CONCURRENT_DOWNLOADS> downloadProgresses;
+
+
+    void SaveDownloadStates();
+    void LoadDownloadStates();
+
+    struct ContentItem {
+        std::string name;
+        std::string authorname;
+        std::string coverpath;
+        std::string synopsis;
+        ContentType type;
+        int totalchapters;
+        int downloadedchapters;
+        DownloadProgress progress;
+        std::string sourceName;
+        std::string sourceUrl;
+
+        // Manga-specific data
+        struct ChapterProvider {
+            std::string name;
+            std::string language;
+            std::string url;
+            std::string uploadDate;
+        };
+        std::vector<ChapterProvider> providers;
+    };
+
+    struct SearchFilter {
+        ContentType contentType = ContentType::ALL;
+        std::string language = "";
+        bool showAdult = false;
+        int maxResults = 2;
+    };
+
+    struct DownloadState {
+        std::string id;
+        std::string contentName;
+        ContentType type;
+        int currentChapter;
+        int totalChapters;
+        bool isPaused;
+        bool isComplete;
+        float progress;
+        std::string lastError;
+        std::chrono::system_clock::time_point lastUpdate;
+    };
+
+    void SaveAllReadingPositions();
+
+    int FindAvailableDownloadSlot();
+    int FindDownloadSlotByTitle(const std::string& novelTitle);
+
+    void RenderSearchFilters();
+    bool SearchContentWithFilters(const std::string& query, const SearchFilter& filter);
+    void RenderContentTypeFilter(SearchFilter& filter);
+    void RenderLanguageFilter(SearchFilter& filter);
+    void RenderDownloadStateIndicator(const DownloadTask& task);
+
+    void SaveReadingPosition(const std::string& contentName, ContentType type,
+        int chapter, float scrollPos = 0.0f, int page = 0);
+
+    void LoadAllReadingPositions();
+
+    void SwitchToMangaReading(const std::string& mangaName, int chapter = 1, int page = 0);
+    void RenderMangaReader();
+    void LoadMangaChapter(const std::string& mangaName, int chapter);
+    void NavigateMangaPage(int direction); // -1 for prev, 1 for next
+    VkDescriptorSet LoadMangaPage(const std::string& imagePath);
+
+    std::string GenerateDownloadId(const std::string& contentName, ContentType type);
+    void UpdateDownloadState(const std::string& downloadId, const DownloadState& state);
+
+    std::string ContentTypeToString(ContentType type);
+    ContentType StringToContentType(const std::string& typeStr);
+
+
+    struct ProcessInfo {
+        std::shared_ptr<std::thread> thread;
+        std::atomic<bool> shouldStop;
+        std::atomic<bool> shouldTerminate;
+        std::string contentName;
+        ContentType contentType;
+
+        // Default constructor
+        ProcessInfo() : shouldStop(false), shouldTerminate(false), contentType(ContentType::NOVEL) {}
+
+        // Move constructor
+        ProcessInfo(ProcessInfo&& other) noexcept
+            : thread(std::move(other.thread))
+            , shouldStop(other.shouldStop.load())
+            , shouldTerminate(other.shouldTerminate.load())
+            , contentName(std::move(other.contentName))
+            , contentType(other.contentType) {
+        }
+
+        // Move assignment operator
+        ProcessInfo& operator=(ProcessInfo&& other) noexcept {
+            if (this != &other) {
+                // Clean up existing thread properly
+                if (thread && thread->joinable()) {
+                    shouldTerminate.store(true);
+                    thread->join();
+                }
+
+                thread = std::move(other.thread);
+                shouldStop.store(other.shouldStop.load());
+                shouldTerminate.store(other.shouldTerminate.load());
+                contentName = std::move(other.contentName);
+                contentType = other.contentType;
+            }
+            return *this;
+        }
+
+        // Destructor
+        ~ProcessInfo() {
+            if (thread && thread->joinable()) {
+                shouldTerminate.store(true);
+                thread->join();  // Wait for thread to finish
+            }
+        }
+
+        // Delete copy constructor and copy assignment
+        ProcessInfo(const ProcessInfo&) = delete;
+        ProcessInfo& operator=(const ProcessInfo&) = delete;
+    };
+
+    std::vector<DownloadState> persistentDownloadStates;
+    std::mutex downloadStateMutex;
+    std::unordered_map<std::string, ProcessInfo> activeProcesses;
+
+
+    // Replace the old Novel with ContentItem
+    std::vector<ContentItem> contentLibrary;  // Replace novellist
+
+    // Reading progress tracking
+    struct ReadingProgress {
+        std::string contentName;
+        ContentType type;
+        int currentChapter;
+        float scrollPosition;
+        int currentPage;  // For manga
+        std::time_t lastRead;
+    };
+    std::unordered_map<std::string, ReadingProgress> readingProgressMap;
+
+
+    struct ReadingPosition {
+        std::string contentName;
+        ContentType type;
+        int currentChapter;
+        float scrollPosition;
+        int currentPage; // For manga
+        std::time_t lastRead;
+
+        ReadingPosition() : type(ContentType::NOVEL), currentChapter(1),
+            scrollPosition(0.0f), currentPage(0), lastRead(0) {
+        }
+    };
+
+    // Content management
+    bool AddContent(const ContentItem& content);
+    bool RemoveContent(const std::string& contentName, const std::string& authorName);
+    void LoadAllContentFromFile();
+    bool SaveContent(const std::vector<ContentItem>& content);
+    void QueueDownloadResume(const DownloadState& state);
+    void CleanupPartialDownload(const std::string& downloadId, const std::string& contentName, ContentType type);
+    void SaveAllReadingProgress();
 
     // ============================================================================
     // Font Management
@@ -390,12 +601,23 @@ public:
     bool CallPythonScript(const std::string& scriptName, const std::vector<std::string>& args,
         std::string& output);
 
+    ReadingPosition LoadReadingPosition(const std::string& contentName);
+
+
 private:
-    // Legacy functions (kept for compatibility but may be removed)
-    void RenderNovelList() { RenderNovelGrid(); }
-    void RenderEnhancedInfoPanel() { RenderInfoPanel(); }
-    void RenderEnhancedNovelGrid() { RenderNovelGrid(); }
-    void DownloadChapter(const std::string& url, const std::string& novelName, int chapterNumber) {
-        // Implementation can be added if needed for individual chapter downloads
-    }
+
+    std::unordered_map<std::string, ReadingPosition> readingPositions;
+    SearchFilter currentSearchFilter;
+
+    struct MangaViewer {
+        std::string mangaName;
+        int currentChapter;
+        int currentPage;
+        int totalPages;
+        std::vector<std::string> pageFiles;
+        VkDescriptorSet currentPageTexture = VK_NULL_HANDLE;
+        bool isLoading = false;
+    };
+    MangaViewer mangaViewer;
+
 };

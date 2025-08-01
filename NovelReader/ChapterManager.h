@@ -82,6 +82,8 @@ public:
     void RenderLayoutTab();
     void RenderNavigationTab();
 
+    void SetScrollPosition(float position) { settings.scrollPosition = position; }
+    float GetScrollPosition() const { return settings.scrollPosition; }
 
     // Font management
     bool InitializeFonts();
@@ -108,6 +110,9 @@ private:
         std::string text;
         TextElement(Type t, const std::string& txt) : type(t), text(txt) {}
     };
+
+    std::string cachedNovelName = "";
+    bool chaptersLoadedInCache = false;
 
 private:
     // Core data
